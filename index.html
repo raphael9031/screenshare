@@ -58,9 +58,11 @@ video{width:100%;max-height:75vh;background:#000;display:block}
 
   <div id="pShare">
     <label for="qual">Quality</label>
-    <select id="qual"><option value="1000000">Smooth (slow connections)</option><option value="2500000" selected>Balanced</option><option value="6000000">Sharp (best for text and video)</option></select>
+    <select id="qual"><option value="smooth" selected>Smooth (best for video, games and weak PCs)</option><option value="balanced">Balanced (Full HD)</option><option value="sharp">Sharp (best for text and slides, lower frame rate)</option></select>
+    <div class="hint" style="margin:6px 0 0">To keep sharing when you minimize the browser, choose <b>Entire screen</b> in the picker (not Window or Tab).</div>
     <div class="chk"><input id="aud" type="checkbox" checked><label for="aud">Share sound too (if your browser allows)</label></div>
     <div class="chk"><input id="ask" type="checkbox" checked><label for="ask">Ask me before someone joins</label></div>
+    <div id="surfWarn" class="hint err" hidden>You are sharing a window or a tab. If you minimize it, viewers will see a frozen or laggy picture. Stop and choose <b>Entire screen</b> instead.</div>
     <div class="bar"><button id="go" class="primary">Start sharing</button><button id="stop" hidden>Stop sharing</button><span id="sStat"></span></div>
     <div id="share" hidden>
       <div class="hint" style="margin:0">Give them this code or link. You can switch to other tabs or apps while sharing, but closing this tab or the browser stops it.</div>
@@ -76,7 +78,7 @@ video{width:100%;max-height:75vh;background:#000;display:block}
     <div id="wStat" class="hint"></div>
     <div id="stage" hidden>
       <video id="vid" autoplay playsinline></video>
-      <div class="bar"><button id="unmute" hidden>Unmute</button><button id="full">Full screen</button></div>
+      <div class="bar"><button id="unmute" hidden>Unmute</button><button id="pip" hidden>Pop out (keeps playing)</button><button id="full">Full screen</button></div>
     </div>
   </div>
 </div>
@@ -212,7 +214,7 @@ function renderViewers() {
     n++;
     if (S.peers[id].pc.connectionState === "connected") open++;
     (function (pid) {
-      add("Viewer " + (S.peers[pid].pc.connectionState === "connected" ? "watching" : "connecting…"), [btn("Remove", function () { closePeer(pid); })]);
+      add("Viewer " + (S.peers[pid].pc.connectionState === "connected" ? "watching" + (S.peers[pid].path === "relay" ? " (through a relay, slower)" : S.peers[pid].path === "direct" ? " (direct)" : "") : "connecting…"), [btn("Remove", function () { closePeer(pid); })]);
     })(id);
   }
   $("sStat").textContent = S.code ? (open ? open + " watching" : "Waiting for viewers…") : $("sStat").textContent;
@@ -238,26 +240,48 @@ function onSharerMsg(o) {
   } else if (p && o.t === "ice" && o.c) addIce(p.pc, o.c);
 }
 function startPeer(id) {
-  var pc = new RTCPeerConnection({ iceServers: getIce() }), topic = S.base + "/r/" + id, br = parseInt($("qual").value, 10);
-  S.peers[id] = { pc: pc };
+  var pc = new RTCPeerConnection({ iceServers: getIce() }), topic = S.base + "/r/" + id, q = QS[$("qual").value] || QS.smooth, me_ = { pc: pc, path: "", q: q };
+  S.peers[id] = me_;
   S.stream.getTracks().forEach(function (t) { pc.addTrack(t, S.stream); });
   pc.onicecandidate = function (e) { if (e.candidate) mqSend(topic, { t: "ice", c: e.candidate }); };
   pc.onconnectionstatechange = function () {
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") closePeer(id); else renderViewers();
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") closePeer(id);
+    else {
+      if (pc.connectionState === "connected" && !me_.path) connType(pc).then(function (t) { me_.path = t || "direct"; if (t === "relay") tuneSender(pc, q, true); renderViewers(); });
+      renderViewers();
+    }
   };
   pc.createOffer().then(function (d) { return pc.setLocalDescription(d); }).then(function () {
     mqSend(topic, { t: "offer", sdp: pc.localDescription.sdp });
-    pc.getSenders().forEach(function (s) {
-      var p;
-      if (!s.track || s.track.kind !== "video") return;
-      p = s.getParameters();
-      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-      p.encodings[0].maxBitrate = br;
-      p.encodings[0].maxFramerate = br < 2000000 ? 15 : 30;
-      s.setParameters(p).catch(noop);
-    });
+    tuneSender(pc, q, false);
   }).catch(noop);
   renderViewers();
+}
+var QS = { smooth: { w: 1280, h: 720, fps: 30, br: 2000000, hint: "motion" }, balanced: { w: 1920, h: 1080, fps: 30, br: 4000000, hint: "motion" }, sharp: { w: 1920, h: 1080, fps: 15, br: 5000000, hint: "detail" } };
+function connType(pc) {
+  return pc.getStats().then(function (st) {
+    var sel = null, pair = null, loc = null, rem = null;
+    st.forEach(function (r) { if (r.type === "transport" && r.selectedCandidatePairId) sel = r.selectedCandidatePairId; });
+    st.forEach(function (r) { if (r.type === "candidate-pair" && (r.id === sel || (!sel && r.nominated && r.state === "succeeded"))) pair = r; });
+    if (!pair) return "";
+    st.forEach(function (r) { if (r.id === pair.localCandidateId) loc = r; if (r.id === pair.remoteCandidateId) rem = r; });
+    return ((loc && loc.candidateType === "relay") || (rem && rem.candidateType === "relay")) ? "relay" : "direct";
+  }).catch(function () { return ""; });
+}
+function tuneSender(pc, q, relay) {
+  pc.getSenders().forEach(function (s) {
+    var par, st, scale = 1, mw = relay ? 1280 : q.w, mh = relay ? 720 : q.h;
+    if (!s.track || s.track.kind !== "video") return;
+    par = s.getParameters(); st = s.track.getSettings ? s.track.getSettings() : {};
+    if (!par.encodings || !par.encodings.length) par.encodings = [{}];
+    if (st.width && st.height) scale = Math.max(1, st.width / mw, st.height / mh);
+    par.encodings[0].maxBitrate = relay ? Math.min(q.br, 1500000) : q.br;
+    par.encodings[0].maxFramerate = relay ? Math.min(q.fps, 24) : q.fps;
+    par.encodings[0].scaleResolutionDownBy = scale;
+    par.encodings[0].priority = "high"; par.encodings[0].networkPriority = "high";
+    par.degradationPreference = q.hint === "detail" ? "maintain-resolution" : "maintain-framerate";
+    s.setParameters(par).catch(function () { delete par.degradationPreference; s.setParameters(par).catch(noop); });
+  });
 }
 function stopShare() {
   Object.keys(S.peers).forEach(closePeer);
@@ -265,6 +289,8 @@ function stopShare() {
   if (S.base) mqOff(S.base + "/s");
   if (S.stream) S.stream.getTracks().forEach(function (t) { t.onended = null; t.stop(); });
   if (S.lock) { try { S.lock.release(); } catch (e) {} S.lock = null; }
+  if (S.unlock) { S.unlock(); S.unlock = null; }
+  $("surfWarn").hidden = true;
   S.stream = null; S.code = ""; S.base = ""; S.pending = {};
   $("share").hidden = true; $("stop").hidden = true; $("go").hidden = false;
   $("qr").textContent = ""; $("viewers").textContent = "";
@@ -274,10 +300,21 @@ $("go").onclick = async function () {
   var vt, link;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) { $("sStat").textContent = "This browser cannot share its screen (phones usually cannot). You can still watch."; return; }
   if (typeof mqtt === "undefined") { $("sStat").textContent = "Could not load the connection library. Check your internet connection and reload."; return; }
-  try { S.stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } }, audio: $("aud").checked }); }
-  catch (e) { $("sStat").textContent = "Sharing was cancelled."; return; }
+  var qq = QS[$("qual").value] || QS.smooth;
+  try {
+    S.stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: qq.fps, max: qq.fps }, width: { max: qq.w }, height: { max: qq.h }, displaySurface: "monitor" }, audio: $("aud").checked, selfBrowserSurface: "exclude", surfaceSwitching: "include", systemAudio: "include" });
+  } catch (e1) {
+    if (e1 && e1.name === "NotAllowedError") { $("sStat").textContent = "Sharing was cancelled."; return; }
+    try { S.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: $("aud").checked }); }
+    catch (e2) { $("sStat").textContent = "Sharing was cancelled."; return; }
+  }
   vt = S.stream.getVideoTracks()[0];
-  if (vt) { vt.contentHint = "detail"; vt.onended = stopShare; }
+  if (vt) {
+    vt.contentHint = qq.hint; vt.onended = stopShare;
+    var ds = vt.getSettings ? vt.getSettings().displaySurface : "";
+    $("surfWarn").hidden = !(ds && ds !== "monitor");
+  }
+  if (navigator.locks) navigator.locks.request("screenshare-lock", function () { return new Promise(function (res) { S.unlock = res; }); }).catch(noop);
   S.code = randStr(6); S.base = PREFIX + S.code;
   await mqOn(S.base + "/s", onSharerMsg);
   getLock();
@@ -300,7 +337,7 @@ $("stop").onclick = stopShare;
 $("copyLink").onclick = function () { copyTxt(shareLink(), this); };
 $("copyCode").onclick = function () { copyTxt(S.code, this); };
 
-var W = { pc: null, topic: "", hello: 0, timer: 0 };
+var W = { pc: null, topic: "", hello: 0, timer: 0, path: "" };
 function stopWatch() {
   clearInterval(W.hello); clearTimeout(W.timer);
   if (W.topic) mqOff(W.topic);
@@ -336,6 +373,8 @@ async function watch(code) {
   pc.onicecandidate = function (e) { if (e.candidate) mqSend(base + "/s", { t: "ice", from: id, c: e.candidate }); };
   pc.ontrack = function (e) {
     var v = $("vid");
+    try { e.receiver.jitterBufferTarget = 0; } catch (x) {}
+    try { e.receiver.playoutDelayHint = 0; } catch (x) {}
     if (v.srcObject !== e.streams[0]) v.srcObject = e.streams[0];
     $("stage").hidden = false;
     $("unmute").hidden = !e.streams[0].getAudioTracks().length;
@@ -345,6 +384,7 @@ async function watch(code) {
     $("wStat").textContent = "Watching. Press Unmute to hear the sound.";
   };
   pc.onconnectionstatechange = function () {
+    if (pc.connectionState === "connected") connType(pc).then(function (t) { W.path = t; if (t === "relay") $("wStat").textContent = "Watching through a relay. It can be slower and may lag."; });
     if (pc.connectionState === "failed") { $("wStat").className = "hint err"; $("wStat").textContent = "Connection failed. Your network may block direct connections. Try again or use another network."; }
     if (pc.connectionState === "disconnected" || pc.connectionState === "closed") $("wStat").textContent = "The sharer stopped or the connection dropped.";
   };
@@ -358,6 +398,14 @@ async function watch(code) {
 loadCfg();
 $("wGo").onclick = function () { watch($("wCode").value.toUpperCase().replace(/[^A-Z0-9]/g, "")); };
 $("wCode").onkeydown = function (e) { if (e.key === "Enter") $("wGo").click(); };
+if (document.pictureInPictureEnabled || $("vid").webkitSetPresentationMode) $("pip").hidden = false;
+$("pip").onclick = function () {
+  var v = $("vid");
+  if (document.pictureInPictureElement) document.exitPictureInPicture().catch(noop);
+  else if (v.requestPictureInPicture) v.requestPictureInPicture().catch(noop);
+  else if (v.webkitSetPresentationMode) v.webkitSetPresentationMode("picture-in-picture");
+};
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && $("vid").srcObject) $("vid").play().catch(noop); });
 $("unmute").onclick = function () {
   var v = $("vid");
   v.muted = !v.muted; this.textContent = v.muted ? "Unmute" : "Mute";
